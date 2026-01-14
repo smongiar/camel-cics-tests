@@ -21,7 +21,9 @@ print_step() { echo -e "${BLUE}[STEP]${NC} $1"; }
 
 # Configuration
 DEFAULT_BRANCH="camel-4.14.2-branch"
-REPO_URL="https://github.com/jboss-fuse/fuse-components.git"
+DEFAULT_REPO_TYPE="middlestream"
+MIDDLESTREAM_REPO_URL="https://github.com/jboss-fuse/fuse-components.git"
+DOWNSTREAM_REPO_URL="https://gitlab.cee.redhat.com/pnc-workspace/jboss-fuse/fuse-components.git"
 WORK_DIR="/tmp/camel-ibm-cics-test"
 REPO_DIR="$WORK_DIR/fuse-components"
 MODULE_DIR="camel-cics"
@@ -31,6 +33,7 @@ CICS_IMAGE="images.paas.redhat.com/fuseqe/ibm-cicstg-container-linux-x86-trial:1
 BRANCH=""
 MAVEN_ARGS=""
 MAVEN_SETTINGS=""
+REPO_TYPE=""
 
 show_usage() {
     cat << EOF
@@ -41,17 +44,21 @@ Arguments:
     MAVEN_ARGS      Additional Maven arguments (optional)
 
 Options:
-    -s, --settings FILE     Path to custom Maven settings.xml file
-    -h, --help              Show this help message
+    -s, --settings FILE           Path to custom Maven settings.xml file
+    -r, --repo-type TYPE          Repository type: 'middlestream' or 'downstream' (default: $DEFAULT_REPO_TYPE)
+    -h, --help                    Show this help message
 
 Examples:
-    $0                              # Use default branch
+    $0                              # Use default branch and middlestream repo
     $0 camel-4.14.2-branch          # Specific branch
     $0 camel-4.14.2-branch "-X"     # With Maven debug output
     $0 camel-4.14.2-branch "-Dtest=CICSGatwayTest"  # Run specific test
     $0 camel-4.14.2-branch "-Dtest=CICSGatwayTest#testSimpleECI"  # Run specific test method
     $0 --settings ~/.m2/my-settings.xml camel-4.14.2-branch  # Custom settings
     $0 -s /path/to/settings.xml     # Custom settings with default branch
+    $0 --repo-type downstream camel-4.14.2-branch  # Use downstream repository
+    $0 -r downstream                # Use downstream repo with defaults
+    $0 --repo-type downstream --settings ~/.m2/settings.xml camel-4.14.2-branch  # All together
     $0 --settings ~/.m2/settings.xml camel-4.14.2-branch "-Dtest=CICSGatwayTest#testSimpleECI"  # All together
 
 Environment Variables:
@@ -200,6 +207,16 @@ check_ctg_client() {
 }
 
 clone_repository() {
+    # Determine which repository URL to use based on repo type
+    local REPO_URL
+    if [ "$REPO_TYPE" = "downstream" ]; then
+        REPO_URL="$DOWNSTREAM_REPO_URL"
+        print_info "Using downstream repository"
+    else
+        REPO_URL="$MIDDLESTREAM_REPO_URL"
+        print_info "Using middlestream repository"
+    fi
+
     # Create work directory if it doesn't exist
     if [ ! -d "$WORK_DIR" ]; then
         print_info "Creating work directory: $WORK_DIR"
@@ -304,6 +321,38 @@ update_test_image_version() {
     echo ""
 }
 
+verify_cics_container_connectivity() {
+    print_step "Verifying CICS container connectivity..."
+
+    # Check if container is running
+    if ! docker ps | grep -q "cics-ctg-container"; then
+        print_warn "CICS container 'cics-ctg-container' is not running"
+        print_info "Tests will use Testcontainers to start a temporary container"
+        echo ""
+        return 1
+    fi
+
+    # Get container IP and port info
+    CONTAINER_IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' cics-ctg-container 2>/dev/null)
+    print_info "Container detected:"
+    print_info "  Container Name: cics-ctg-container"
+    print_info "  Container IP: ${CONTAINER_IP:-N/A}"
+    print_info "  Mapped Ports: 2006:2006, 2035:2035"
+
+    # Test connectivity to port 2006
+    print_info "Testing connectivity to localhost:2006..."
+    if timeout 3 bash -c "cat < /dev/null > /dev/tcp/localhost/2006" 2>/dev/null; then
+        print_info "✓ Successfully connected to CICS TG on localhost:2006"
+    else
+        print_warn "✗ Could not connect to localhost:2006"
+        print_warn "Make sure CICS TG is fully started and listening"
+        print_info "Check container logs: docker logs cics-ctg-container"
+    fi
+
+    echo ""
+    return 0
+}
+
 configure_local_container() {
     print_step "Configuring tests to use local CICS container..."
 
@@ -382,6 +431,9 @@ EOF
     print_info "Test configured to use local container at localhost:2006"
     print_info "Original test file backed up to: $TEST_FILE.backup"
     echo ""
+    print_warn "IMPORTANT: To see connection activity in CICS logs, run in another terminal:"
+    print_warn "  docker logs -f cics-ctg-container 2>&1 | grep -E 'CTG650|connected|disconnected'"
+    echo ""
 }
 
 run_tests() {
@@ -433,10 +485,12 @@ run_tests() {
         print_info "Tests completed successfully!"
     else
         print_error "Tests failed with exit code: $TEST_RESULT"
-        exit $TEST_RESULT
     fi
 
     cd - > /dev/null
+
+    # Return the test result but don't exit yet - we want to show the summary
+    return $TEST_RESULT
 }
 
 show_test_summary() {
@@ -444,9 +498,18 @@ show_test_summary() {
     echo ""
 
     SUREFIRE_REPORTS="$REPO_DIR/$MODULE_DIR/target/surefire-reports"
+    SUMMARY_CSV="$WORK_DIR/test-summary.csv"
+    SUMMARY_HTML="$WORK_DIR/test-summary.html"
 
     if [ -d "$SUREFIRE_REPORTS" ]; then
         print_info "Test reports location: $SUREFIRE_REPORTS"
+        echo ""
+
+        # Create CSV summary file
+        echo "Test Class,Test Method,Result,Failure Reason" > "$SUMMARY_CSV"
+
+        # Create HTML summary file header
+        create_html_header "$SUMMARY_HTML"
 
         # Count test results
         TOTAL_TESTS=$(find "$SUREFIRE_REPORTS" -name "TEST-*.xml" -exec grep -h "tests=" {} \; 2>/dev/null | \
@@ -458,20 +521,456 @@ show_test_summary() {
         SKIPPED_TESTS=$(find "$SUREFIRE_REPORTS" -name "TEST-*.xml" -exec grep -h "skipped=" {} \; 2>/dev/null | \
                         grep -oP 'skipped="\K[0-9]+' | awk '{s+=$1} END {print s}')
 
+        PASSED_TESTS=$((${TOTAL_TESTS:-0} - ${FAILED_TESTS:-0} - ${ERROR_TESTS:-0} - ${SKIPPED_TESTS:-0}))
+
         echo "  Total Tests:   ${TOTAL_TESTS:-0}"
-        echo "  Passed:        $((${TOTAL_TESTS:-0} - ${FAILED_TESTS:-0} - ${ERROR_TESTS:-0} - ${SKIPPED_TESTS:-0}))"
-        echo "  Failed:        ${FAILED_TESTS:-0}"
-        echo "  Errors:        ${ERROR_TESTS:-0}"
-        echo "  Skipped:       ${SKIPPED_TESTS:-0}"
+        if [ "${PASSED_TESTS}" -gt 0 ]; then
+            echo -e "  ${GREEN}Passed:        ${PASSED_TESTS}${NC}"
+        fi
+        if [ "${FAILED_TESTS:-0}" -gt 0 ]; then
+            echo -e "  ${RED}Failed:        ${FAILED_TESTS}${NC}"
+        fi
+        if [ "${ERROR_TESTS:-0}" -gt 0 ]; then
+            echo -e "  ${RED}Errors:        ${ERROR_TESTS}${NC}"
+        fi
+        if [ "${SKIPPED_TESTS:-0}" -gt 0 ]; then
+            echo -e "  ${YELLOW}Skipped:       ${SKIPPED_TESTS}${NC}"
+        fi
         echo ""
 
-        # List test classes
+        # List test classes with their results and write to CSV
         print_info "Test classes executed:"
-        find "$SUREFIRE_REPORTS" -name "TEST-*.xml" -exec basename {} \; 2>/dev/null | \
-            sed 's/TEST-//;s/.xml$//' | sed 's/^/  - /'
+        for xml_file in "$SUREFIRE_REPORTS"/TEST-*.xml; do
+            if [ -f "$xml_file" ]; then
+                TEST_CLASS=$(basename "$xml_file" | sed 's/TEST-//;s/.xml$//')
+                TEST_FAILURES=$(grep -oP 'failures="\K[0-9]+' "$xml_file" | head -1)
+                TEST_ERRORS=$(grep -oP 'errors="\K[0-9]+' "$xml_file" | head -1)
+                TEST_COUNT=$(grep -oP 'tests="\K[0-9]+' "$xml_file" | head -1)
+
+                if [ "${TEST_FAILURES:-0}" -gt 0 ] || [ "${TEST_ERRORS:-0}" -gt 0 ]; then
+                    echo -e "  ${RED}✗${NC} $TEST_CLASS (${TEST_COUNT} tests, ${TEST_FAILURES:-0} failures, ${TEST_ERRORS:-0} errors)"
+                else
+                    echo -e "  ${GREEN}✓${NC} $TEST_CLASS (${TEST_COUNT} tests)"
+                fi
+
+                # Parse individual test cases and write to CSV and HTML
+                parse_test_cases_to_csv "$xml_file" "$TEST_CLASS" "$SUMMARY_CSV"
+                parse_test_cases_to_html "$xml_file" "$TEST_CLASS" "$SUMMARY_HTML"
+            fi
+        done
+        echo ""
+
+        # If there are failures or errors, show details
+        if [ "${FAILED_TESTS:-0}" -gt 0 ] || [ "${ERROR_TESTS:-0}" -gt 0 ]; then
+            print_error "Failed/Error Test Details:"
+            echo ""
+            for xml_file in "$SUREFIRE_REPORTS"/TEST-*.xml; do
+                if [ -f "$xml_file" ]; then
+                    TEST_CLASS=$(basename "$xml_file" | sed 's/TEST-//;s/.xml$//')
+                    # Look for failure or error elements
+                    if grep -q '<failure' "$xml_file" || grep -q '<error' "$xml_file"; then
+                        echo -e "${YELLOW}Class: $TEST_CLASS${NC}"
+                        # Extract testcase names that failed
+                        grep -A1 '<testcase' "$xml_file" | grep -B1 '<failure\|<error' | \
+                            grep 'testcase name=' | sed 's/.*name="\([^"]*\)".*/  - \1/' || true
+                        echo ""
+                    fi
+                fi
+            done
+        fi
+
+        # Check for connection-related issues
+        print_info "Checking for connection issues..."
+        if grep -r "ECI_ERR_UNKNOWN_SERVER\|connection refused\|Connection refused" "$SUREFIRE_REPORTS"/*.txt 2>/dev/null | head -5; then
+            echo ""
+            print_warn "Connection errors detected in test output"
+            print_warn "This may indicate tests are not connecting to the CICS container"
+            echo ""
+            print_info "Troubleshooting steps:"
+            print_info "1. Verify CICS container is running: docker ps | grep cics"
+            print_info "2. Check CICS logs: docker logs cics-ctg-container"
+            print_info "3. Test connectivity: nc -zv localhost 2006"
+            print_info "4. Monitor connections: docker logs -f cics-ctg-container 2>&1 | grep CTG650"
+        else
+            print_info "No obvious connection errors found in test output"
+        fi
+        # Close HTML file
+        create_html_footer "$SUMMARY_HTML" "${TOTAL_TESTS:-0}" "${PASSED_TESTS}" "${FAILED_TESTS:-0}" "${ERROR_TESTS:-0}" "${SKIPPED_TESTS:-0}"
+
+        # Display summary file locations
+        echo ""
+        print_info "Test summary files created:"
+        print_info "  CSV:  $SUMMARY_CSV"
+        print_info "  HTML: $SUMMARY_HTML"
+        echo ""
+        print_info "Summary preview (first 20 lines):"
+        head -20 "$SUMMARY_CSV" | column -t -s',' 2>/dev/null || head -20 "$SUMMARY_CSV"
+        echo ""
+        print_info "Open HTML summary in browser:"
+        print_info "  firefox $SUMMARY_HTML"
+        print_info "  google-chrome $SUMMARY_HTML"
+        print_info "  xdg-open $SUMMARY_HTML"
     else
-        print_warn "Surefire reports directory not found"
+        print_warn "Surefire reports directory not found: $SUREFIRE_REPORTS"
+        print_warn "Tests may not have run, or Maven build failed before test execution"
     fi
+    echo ""
+}
+
+create_html_header() {
+    local html_file="$1"
+    cat > "$html_file" << 'EOF'
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Test Execution Summary</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 20px;
+            background-color: #f5f5f5;
+        }
+        h1 {
+            color: #333;
+            border-bottom: 3px solid #4CAF50;
+            padding-bottom: 10px;
+        }
+        .summary {
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            margin-bottom: 20px;
+        }
+        .stats {
+            display: flex;
+            gap: 20px;
+            margin: 20px 0;
+        }
+        .stat-box {
+            flex: 1;
+            padding: 20px;
+            border-radius: 8px;
+            text-align: center;
+            color: #ffffff;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.3);
+            border: 2px solid rgba(255,255,255,0.2);
+        }
+        .stat-box.total {
+            background: linear-gradient(135deg, #2196F3 0%, #1976D2 100%);
+        }
+        .stat-box.passed {
+            background: linear-gradient(135deg, #4CAF50 0%, #388E3C 100%);
+        }
+        .stat-box.failed {
+            background: linear-gradient(135deg, #f44336 0%, #D32F2F 100%);
+        }
+        .stat-box.error {
+            background: linear-gradient(135deg, #FF9800 0%, #F57C00 100%);
+        }
+        .stat-box.skipped {
+            background: linear-gradient(135deg, #9E9E9E 0%, #757575 100%);
+        }
+        .stat-number {
+            font-size: 42px;
+            font-weight: bold;
+            color: #ffffff !important;
+            text-shadow: 2px 2px 4px rgba(0,0,0,0.5);
+            line-height: 1.2;
+            margin-bottom: 8px;
+        }
+        .stat-label {
+            font-size: 16px;
+            margin-top: 5px;
+            color: #ffffff !important;
+            font-weight: 600;
+            text-shadow: 1px 1px 2px rgba(0,0,0,0.3);
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            background: white;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        th {
+            background-color: #4CAF50;
+            color: white;
+            padding: 12px;
+            text-align: left;
+            position: sticky;
+            top: 0;
+        }
+        td {
+            padding: 10px;
+            border-bottom: 1px solid #ddd;
+        }
+        tr:hover { background-color: #f5f5f5; }
+        .passed { color: #4CAF50; font-weight: bold; }
+        .failed { color: #f44336; font-weight: bold; }
+        .error { color: #FF9800; font-weight: bold; }
+        .reason { color: #666; font-size: 0.9em; }
+        .filter {
+            margin: 10px 0;
+            padding: 10px;
+            background: white;
+            border-radius: 5px;
+        }
+        .filter input {
+            padding: 8px;
+            width: 300px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+        }
+        .filter button {
+            padding: 8px 15px;
+            margin-left: 10px;
+            border: none;
+            border-radius: 4px;
+            background: #4CAF50;
+            color: white;
+            cursor: pointer;
+        }
+        .filter button:hover { background: #45a049; }
+    </style>
+</head>
+<body>
+    <h1>🧪 Test Execution Summary</h1>
+    <div class="summary">
+        <p><strong>Report Generated:</strong> <span id="timestamp"></span></p>
+        <p><strong>Repository:</strong> <span id="repo-type"></span></p>
+        <div class="stats" id="stats-container">
+            <!-- Stats will be inserted here -->
+        </div>
+    </div>
+
+    <div class="filter">
+        <input type="text" id="search" placeholder="Search test class or method..." onkeyup="filterTable()">
+        <button onclick="filterByResult('all')">All</button>
+        <button onclick="filterByResult('PASSED')" style="background:#4CAF50">Passed</button>
+        <button onclick="filterByResult('FAILED')" style="background:#f44336">Failed</button>
+        <button onclick="filterByResult('ERROR')" style="background:#FF9800">Error</button>
+    </div>
+
+    <table id="results-table">
+        <thead>
+            <tr>
+                <th>Test Class</th>
+                <th>Test Method</th>
+                <th>Result</th>
+                <th>Failure Reason</th>
+            </tr>
+        </thead>
+        <tbody>
+EOF
+
+    # Add timestamp using JavaScript
+    echo "<script>" >> "$html_file"
+    echo "document.getElementById('timestamp').textContent = new Date().toLocaleString();" >> "$html_file"
+    echo "document.getElementById('repo-type').textContent = '${REPO_TYPE:-Unknown}';" >> "$html_file"
+    echo "</script>" >> "$html_file"
+}
+
+create_html_footer() {
+    local html_file="$1"
+    local total="$2"
+    local passed="$3"
+    local failed="$4"
+    local errors="$5"
+    local skipped="$6"
+
+    cat >> "$html_file" << EOF
+        </tbody>
+    </table>
+
+    <script>
+        // Insert stats
+        const statsHtml = \`
+            <div class="stat-box total">
+                <div class="stat-number">${total}</div>
+                <div class="stat-label">Total Tests</div>
+            </div>
+            <div class="stat-box passed">
+                <div class="stat-number">${passed}</div>
+                <div class="stat-label">Passed</div>
+            </div>
+            <div class="stat-box failed">
+                <div class="stat-number">${failed}</div>
+                <div class="stat-label">Failed</div>
+            </div>
+            <div class="stat-box error">
+                <div class="stat-number">${errors}</div>
+                <div class="stat-label">Errors</div>
+            </div>
+            <div class="stat-box skipped">
+                <div class="stat-number">${skipped}</div>
+                <div class="stat-label">Skipped</div>
+            </div>
+        \`;
+        document.getElementById('stats-container').innerHTML = statsHtml;
+
+        // Filter functionality
+        function filterTable() {
+            const input = document.getElementById('search');
+            const filter = input.value.toUpperCase();
+            const table = document.getElementById('results-table');
+            const rows = table.getElementsByTagName('tr');
+
+            for (let i = 1; i < rows.length; i++) {
+                const cells = rows[i].getElementsByTagName('td');
+                let found = false;
+
+                for (let j = 0; j < cells.length; j++) {
+                    if (cells[j].textContent.toUpperCase().indexOf(filter) > -1) {
+                        found = true;
+                        break;
+                    }
+                }
+
+                rows[i].style.display = found ? '' : 'none';
+            }
+        }
+
+        function filterByResult(result) {
+            const table = document.getElementById('results-table');
+            const rows = table.getElementsByTagName('tr');
+
+            for (let i = 1; i < rows.length; i++) {
+                const resultCell = rows[i].getElementsByTagName('td')[2];
+                if (result === 'all' || resultCell.textContent === result) {
+                    rows[i].style.display = '';
+                } else {
+                    rows[i].style.display = 'none';
+                }
+            }
+        }
+    </script>
+</body>
+</html>
+EOF
+}
+
+parse_test_cases_to_csv() {
+    local xml_file="$1"
+    local test_class="$2"
+    local output_csv="$3"
+
+    # Use awk to parse XML and extract all testcase elements
+    awk '
+    /<testcase/ {
+        in_testcase=1
+        testcase_content=$0
+        # Extract test method name
+        match($0, /name="([^"]+)"/, arr)
+        test_name=arr[1]
+
+        # Check if self-closing
+        if ($0 ~ /\/>/) {
+            print "\"'"$test_class"'\",\"" test_name "\",\"PASSED\",\"\"" >> "'"$output_csv"'"
+            in_testcase=0
+            next
+        }
+    }
+
+    in_testcase && /<\/testcase>/ {
+        testcase_content = testcase_content "\n" $0
+
+        # Determine result
+        result="PASSED"
+        reason=""
+
+        if (testcase_content ~ /<failure/) {
+            result="FAILED"
+            match(testcase_content, /message="([^"]+)"/, arr)
+            reason=arr[1]
+            gsub(/"/, "\"\"", reason)
+        } else if (testcase_content ~ /<error/) {
+            result="ERROR"
+            match(testcase_content, /message="([^"]+)"/, arr)
+            reason=arr[1]
+            gsub(/"/, "\"\"", reason)
+        } else if (testcase_content ~ /<skipped/) {
+            result="SKIPPED"
+            match(testcase_content, /message="([^"]+)"/, arr)
+            reason=arr[1]
+            gsub(/"/, "\"\"", reason)
+        }
+
+        print "\"'"$test_class"'\",\"" test_name "\",\"" result "\",\"" reason "\"" >> "'"$output_csv"'"
+        in_testcase=0
+        testcase_content=""
+    }
+
+    in_testcase {
+        testcase_content = testcase_content "\n" $0
+    }
+    ' "$xml_file"
+}
+
+parse_test_cases_to_html() {
+    local xml_file="$1"
+    local test_class="$2"
+    local output_html="$3"
+
+    # Use awk to parse XML and extract all testcase elements
+    awk '
+    /<testcase/ {
+        in_testcase=1
+        testcase_content=$0
+        # Extract test method name
+        match($0, /name="([^"]+)"/, arr)
+        test_name=arr[1]
+
+        # Check if self-closing
+        if ($0 ~ /\/>/) {
+            print "<tr><td>'"$test_class"'</td><td>" test_name "</td><td class=\"passed\">PASSED</td><td class=\"reason\"></td></tr>" >> "'"$output_html"'"
+            in_testcase=0
+            next
+        }
+    }
+
+    in_testcase && /<\/testcase>/ {
+        testcase_content = testcase_content "\n" $0
+
+        # Determine result
+        result="PASSED"
+        css_class="passed"
+        reason=""
+
+        if (testcase_content ~ /<failure/) {
+            result="FAILED"
+            css_class="failed"
+            match(testcase_content, /message="([^"]+)"/, arr)
+            reason=arr[1]
+            gsub(/</, "\\&lt;", reason)
+            gsub(/>/, "\\&gt;", reason)
+        } else if (testcase_content ~ /<error/) {
+            result="ERROR"
+            css_class="error"
+            match(testcase_content, /message="([^"]+)"/, arr)
+            reason=arr[1]
+            gsub(/</, "\\&lt;", reason)
+            gsub(/>/, "\\&gt;", reason)
+        } else if (testcase_content ~ /<skipped/) {
+            result="SKIPPED"
+            css_class="skipped"
+            match(testcase_content, /message="([^"]+)"/, arr)
+            reason=arr[1]
+            gsub(/</, "\\&lt;", reason)
+            gsub(/>/, "\\&gt;", reason)
+        }
+
+        print "<tr><td>'"$test_class"'</td><td>" test_name "</td><td class=\"" css_class "\">" result "</td><td class=\"reason\">" reason "</td></tr>" >> "'"$output_html"'"
+        in_testcase=0
+        testcase_content=""
+    }
+
+    in_testcase {
+        testcase_content = testcase_content "\n" $0
+    }
+    ' "$xml_file"
 }
 
 cleanup() {
@@ -498,6 +997,16 @@ main() {
             case $1 in
                 -s|--settings)
                     MAVEN_SETTINGS="$2"
+                    shift 2
+                    ;;
+                -r|--repo-type)
+                    REPO_TYPE="$2"
+                    # Validate repo type
+                    if [[ "$REPO_TYPE" != "middlestream" && "$REPO_TYPE" != "downstream" ]]; then
+                        print_error "Invalid repository type: $REPO_TYPE"
+                        print_error "Valid values are: middlestream, downstream"
+                        exit 1
+                    fi
                     shift 2
                     ;;
                 -h|--help)
@@ -538,11 +1047,18 @@ main() {
 
     # Set defaults for positional arguments
     BRANCH="${BRANCH:-$DEFAULT_BRANCH}"
+    REPO_TYPE="${REPO_TYPE:-$DEFAULT_REPO_TYPE}"
 
     echo ""
     print_info "Camel CICS Integration Test Runner"
     print_info "=================================="
     echo ""
+    print_info "Repository Type: $REPO_TYPE"
+    if [ "$REPO_TYPE" = "downstream" ]; then
+        print_info "Repository URL: $DOWNSTREAM_REPO_URL"
+    else
+        print_info "Repository URL: $MIDDLESTREAM_REPO_URL"
+    fi
     print_info "Branch: $BRANCH"
     print_info "Image: $CICS_IMAGE"
     if [ -n "$MAVEN_SETTINGS" ]; then
@@ -555,13 +1071,25 @@ main() {
     clone_repository
     check_cics_image
     update_test_image_version
+    verify_cics_container_connectivity
     configure_local_container
     run_tests
+    TEST_EXIT_CODE=$?
+
+    # Always show test summary, even if tests failed
     show_test_summary
     cleanup
 
     echo ""
-    print_info "Test execution complete!"
+    if [ $TEST_EXIT_CODE -eq 0 ]; then
+        print_info "Test execution complete!"
+    else
+        print_error "Test execution completed with failures (exit code: $TEST_EXIT_CODE)"
+        echo ""
+        print_info "Check the detailed test reports at:"
+        print_info "  $REPO_DIR/$MODULE_DIR/target/surefire-reports/"
+        exit $TEST_EXIT_CODE
+    fi
 }
 
 # Run main function

@@ -153,6 +153,7 @@ That's it! You now have a working CICS TG environment and can run integration te
 |------|---------|
 | **run-cics-container.sh** | Manage CICS TG 10.1 container |
 | **run-tests.sh** | Run Camel CICS integration tests |
+| **monitor-cics-connections.sh** | Monitor CICS connections in real-time |
 
 ### Container Commands
 
@@ -211,15 +212,22 @@ docker rm cics-ctg
 The `run-tests.sh` script automates the entire test process:
 
 ```bash
-# Run tests with default branch (camel-4.14.2-branch)
+# Run tests with default branch (camel-4.14.2-branch) and middlestream repo
 ./run-tests.sh
 
 # Run tests with specific branch
 ./run-tests.sh camel-4.14.2-branch
 ./run-tests.sh camel-4.8-branch
 
+# Use downstream repository (GitLab)
+./run-tests.sh --repo-type downstream
+./run-tests.sh -r downstream camel-4.14.2-branch
+
 # Run specific test class
 ./run-tests.sh camel-4.14.2-branch "-Dtest=CICSGatwayTest"
+
+# Run all tests
+./run-tests.sh camel-4.14.2-branch "-Dtest=*"
 
 # Run specific test method
 ./run-tests.sh camel-4.14.2-branch "-Dtest=CICSGatwayTest#testSimpleECI"
@@ -231,12 +239,21 @@ The `run-tests.sh` script automates the entire test process:
 ./run-tests.sh --settings ~/.m2/my-settings.xml
 ./run-tests.sh -s /path/to/custom-settings.xml camel-4.14.2-branch
 
-# Combine settings with specific test
-./run-tests.sh --settings ~/.m2/settings.xml camel-4.14.2-branch "-Dtest=CICSGatwayTest#testSimpleECI"
+# Combine all options
+./run-tests.sh --repo-type downstream --settings ~/.m2/settings-tnb.xml camel-4.14.2-branch "-Dtest=*"
 
 # Use existing repository (skip clone)
 SKIP_CLONE=true ./run-tests.sh
 ```
+
+### Repository Types
+
+The test runner supports two repository types:
+
+- **middlestream** (default): GitHub repository - `https://github.com/jboss-fuse/fuse-components.git`
+- **downstream**: GitLab repository - `https://gitlab.cee.redhat.com/pnc-workspace/jboss-fuse/fuse-components.git`
+
+Use `--repo-type` or `-r` to select which repository to clone.
 
 ### Integration Tests vs Unit Tests
 
@@ -308,15 +325,23 @@ The connection infrastructure is working correctly - the failures are due to the
    - If missing and container not running: provides clear instructions
 3. Creates work directory in `/tmp/camel-ibm-cics-test`
 4. Clones fuse-components repository to `/tmp/camel-ibm-cics-test/fuse-components` (or uses existing)
+   - Uses middlestream (GitHub) or downstream (GitLab) based on `--repo-type` parameter
 5. Checks out specified branch
 6. Validates CICS TG image availability
 7. Detects image version mismatches
-8. **Configures tests to use local container** (if running)
+8. **Verifies CICS container connectivity**
+   - Tests connection to `localhost:2006`
+   - Reports container status and network information
+9. **Configures tests to use local container** (if running)
    - If `cics-ctg-container` is running: modifies tests to connect to `localhost:2006`
    - If not running: tests will use Testcontainers to start a new instance
    - This avoids duplicate containers and makes tests faster
-9. Runs Maven tests
-10. Displays test summary and reports
+10. Runs Maven tests
+11. **Displays comprehensive test summary** (even when tests fail)
+    - Color-coded test results
+    - Failed test details
+    - Connection issue diagnostics
+    - Troubleshooting guidance
 
 ### Using Local vs Testcontainers
 
@@ -349,6 +374,25 @@ The tests will:
 - Stop and remove the container when done
 
 **Note:** The script creates a backup of the original test file at `AbstractCICSContainerizedTest.java.backup` before modifying it.
+
+### Monitoring CICS Connections During Tests
+
+To verify that tests are actually connecting to the CICS container, use the connection monitor script in a separate terminal:
+
+```bash
+# Terminal 1: Monitor connections
+./monitor-cics-connections.sh
+
+# Terminal 2: Run tests
+./run-tests.sh --settings ~/.m2/settings-tnb.xml camel-4.14.2-branch "-Dtest=*"
+```
+
+The monitor script will show:
+- **Green [CONNECT]** messages when tests connect to CICS
+- **Yellow [DISCONNECT]** messages when tests disconnect
+- **Blue [INFO]** messages for other CICS events
+
+If you don't see any connection messages while tests are running, it means tests are not connecting to the CICS container (they may be using mocks or a different container instance).
 
 ### Working Directory and Cleanup
 
@@ -547,6 +591,47 @@ docker login images.paas.redhat.com
 - If running manually, ensure: `docker run -e LICENSE=accept ...`
 
 ### Test Issues
+
+**No connection activity showing in CICS logs**
+
+If you run tests but see no connection messages in the CICS container logs, this usually means:
+
+1. **Tests are using mocks instead of real connections**
+   - Many tests (like `CICSGatwayTest`, `CICSCallTypeTest`) use mocks by default
+   - Only integration tests actually connect to CICS
+   - See "Integration Tests vs Unit Tests" section above for details
+
+2. **Tests are using Testcontainers instead of your local container**
+   - Solution: Make sure `cics-ctg-container` is running before running tests
+   - The script will detect it and configure tests to use it
+
+3. **AbstractCICSContainerizedTest.java wasn't modified correctly**
+   - Check if backup file exists: `AbstractCICSContainerizedTest.java.backup`
+   - If modified, the file should contain `MockCTGContainer` class
+   - If not, the script may have failed to detect the local container
+
+**To verify tests are connecting:**
+
+```bash
+# Terminal 1: Monitor connections (must see output when tests run)
+./monitor-cics-connections.sh
+
+# Terminal 2: Run integration tests only
+./run-tests.sh camel-4.14.2-branch "-Dtest=*ConnectionFactoryTest,CustomBindingTest"
+```
+
+Expected behavior:
+- You should see `[CONNECT]` messages when tests start
+- You should see `[DISCONNECT]` messages when tests end
+- Each test class may open/close connections multiple times
+
+**If still no connections:**
+1. Check the modified test file location:
+   ```bash
+   cat /tmp/camel-ibm-cics-test/fuse-components/camel-cics/src/test/java/com/redhat/camel/component/cics/AbstractCICSContainerizedTest.java
+   ```
+2. Verify it contains `return "localhost";` in the `getHost()` method
+3. Check if tests extend `AbstractCICSContainerizedTest`
 
 **Tests fail with "Could not find or load main class"**
 ```bash
