@@ -119,6 +119,16 @@ run_container() {
     print_info "CTG Port: $CTG_PORT"
     print_info "CTG SSL Port: $CTG_SSL_PORT"
     echo ""
+
+    # Copy custom config file to the correct location
+    if [ -f "config/ctg.ini" ]; then
+        print_info "Copying custom config file to container..."
+        docker cp config/ctg.ini $CONTAINER_NAME:/var/cicscli/ctg.ini
+        print_info "Restarting container to apply configuration..."
+        docker restart $CONTAINER_NAME > /dev/null
+        sleep 3
+    fi
+
     print_info "Waiting for CTG to start (this may take 30-60 seconds)..."
     sleep 5
 
