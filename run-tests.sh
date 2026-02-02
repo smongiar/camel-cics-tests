@@ -477,7 +477,7 @@ run_tests() {
     set +e
     eval $MVN_CMD
     TEST_RESULT=$?
-    set -e
+    # Keep set +e active - don't re-enable set -e here
 
     echo "========================================================================"
     echo ""
