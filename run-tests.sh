@@ -473,10 +473,11 @@ run_tests() {
     print_step "Starting test execution..."
     echo "========================================================================"
 
-    # Run Maven tests
+    # Run Maven tests (use set +e temporarily to allow failures and capture exit code)
+    set +e
     eval $MVN_CMD
-
     TEST_RESULT=$?
+    set -e
 
     echo "========================================================================"
     echo ""
