@@ -141,16 +141,16 @@ check_ctg_client() {
 
         print_step "Step 1: Extracting CTG JAR from container..."
         # Try to find the CTG JAR in the container
-        CTG_JAR_IN_CONTAINER=$(docker exec cics-ctg-container find /opt/ibm/ctg -name "ctgclient.jar" 2>/dev/null | head -1)
+        CTG_JAR_IN_CONTAINER=$(docker exec cics-ctg-container find /opt/ibm/cicstg/classes -name "ctgclient.jar" 2>/dev/null | head -1)
 
         if [ -z "$CTG_JAR_IN_CONTAINER" ]; then
             # Try alternative naming
-            CTG_JAR_IN_CONTAINER=$(docker exec cics-ctg-container find /opt/ibm/ctg -name "*ctg*.jar" 2>/dev/null | grep -i client | head -1)
+            CTG_JAR_IN_CONTAINER=$(docker exec cics-ctg-container find /opt/ibm/cicstg/classes -name "*ctg*.jar" 2>/dev/null | grep -i client | head -1)
         fi
 
         if [ -z "$CTG_JAR_IN_CONTAINER" ]; then
             print_error "Could not find CTG client JAR in container"
-            print_info "Searched in: /opt/ibm/ctg"
+            print_info "Searched in: /opt/ibm/cicstg/classes"
             echo ""
             print_info "Manual installation required. See README.md for details."
             exit 1
