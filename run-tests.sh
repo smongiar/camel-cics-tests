@@ -1074,8 +1074,12 @@ main() {
     update_test_image_version
     verify_cics_container_connectivity
     configure_local_container
+
+    # Disable set -e temporarily to allow run_tests to fail without exiting
+    set +e
     run_tests
     TEST_EXIT_CODE=$?
+    set -e
 
     # Always show test summary, even if tests failed
     show_test_summary
