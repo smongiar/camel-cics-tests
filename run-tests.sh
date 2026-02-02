@@ -1079,11 +1079,13 @@ main() {
     set +e
     run_tests
     TEST_EXIT_CODE=$?
-    set -e
 
-    # Always show test summary, even if tests failed
+    # Always show test summary, even if tests failed (keep set +e active)
     show_test_summary
     cleanup
+
+    # Re-enable set -e before final exit
+    set -e
 
     echo ""
     if [ $TEST_EXIT_CODE -eq 0 ]; then
